@@ -19,6 +19,7 @@ ES_HOSTS = ["http://10.10.25.22:9200"]  # 可放多个节点
 # INDEX = "biz_post_list_szr1"
 INDEX = "biz_tos_rss_news"
 username = "elastic"
+
 password = "easymer@es@2023"
 news = [
     "今日新闻网-焦点",
@@ -33,8 +34,8 @@ news = [
     "TVBS新闻网-热门"
 ]
 # AI
-API_KEY = "app-6ZraQ41qXnNwWrmzAqdyj4qX"
-URL = "http://10.10.23.34:8660/v1/chat-messages"
+API_KEY = "app-bLCySrNdNLlYdLmYft16DgTY"
+URL = "http://10.10.23.34:8660/v1/workflows/run"
 
 _CN_NUM = {
     "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
@@ -117,11 +118,13 @@ def change(es_result: list) -> list:
     # 网站映射表
     site_map = {
         "今日新闻网": {"domain": "www.nownews.com", "color": "蓝营"},
+        "ETTODAY新闻云": {"domain": "www.ettoday.net", "color": "绿营"},
         "ETtoday新闻云": {"domain": "www.ettoday.net", "color": "绿营"},
         "自由时报": {"domain": "news.ltn.com.tw", "color": "绿营"},
         "联合新闻网": {"domain": "udn.com", "color": "蓝营"},
         "中时电子报": {"domain": "www.chinatimes.com", "color": "蓝营"},
         "东森新闻": {"domain": "news.ebc.net.tw", "color": "蓝营"},
+        "ETtoday 东森新闻": {"domain": "news.ebc.net.tw", "color": "蓝营"},
         "三立新闻网": {"domain": "www.setn.com", "color": "绿营"},
         "TVBS新闻网": {"domain": "news.tvbs.com.tw", "color": "蓝营"},
     }
@@ -179,7 +182,6 @@ def search_datas(month: str) -> list:
             datas = change(export_all(es, INDEX, query))
             # 数据经过ai agent分析
             for data in datas:
-                print(data)
                 results.append(call_api(data))
         except exceptions.AuthenticationException as e:
             print("认证失败：", e)
@@ -203,9 +205,7 @@ def call_api(new_str: str) -> str:
         "inputs": {
             "json": f"{new_str}"
         },
-        "query": "hello,my name is bill!",
         "response_mode": "blocking",
-        "conversation_id": "",
         "user": "admin"
     }
     try:
@@ -213,10 +213,10 @@ def call_api(new_str: str) -> str:
         response.raise_for_status()  # 如果不是 2xx 会抛异常
         # 返回 JSON 格式数据
         response_data = response.json()
-        return response_data.get("answer")
+        return response_data.get("data", {}).get("outputs", {}).get("result", "")
     except requests.exceptions.RequestException as e:
         print(f"请求失败: {e}")
-        return None
+        return new_str
 
 
 
