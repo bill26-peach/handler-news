@@ -213,7 +213,9 @@ def call_api(new_str: str) -> str:
         response.raise_for_status()  # 如果不是 2xx 会抛异常
         # 返回 JSON 格式数据
         response_data = response.json()
-        return response_data.get("data", {}).get("outputs", {}).get("result", "")
+        outputs_get = response_data.get("data", {}).get("outputs", {}).get("result", "")
+        print("√", outputs_get)
+        return outputs_get
     except requests.exceptions.RequestException as e:
         print(f"请求失败: {e}")
         return new_str
