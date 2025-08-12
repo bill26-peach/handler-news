@@ -35,7 +35,7 @@ news = [
 ]
 # AI
 API_KEY = "app-bLCySrNdNLlYdLmYft16DgTY"
-URL = "http://10.10.23.34:8660/v1/workflows/run"
+URL = "http://10.10.25.34:8660/v1/workflows/run"
 
 _CN_NUM = {
     "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
