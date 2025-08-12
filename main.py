@@ -179,6 +179,7 @@ def search_datas(month: str) -> list:
             datas = change(export_all(es, INDEX, query))
             # 数据经过ai agent分析
             for data in datas:
+                print(data)
                 results.append(call_api(data))
         except exceptions.AuthenticationException as e:
             print("认证失败：", e)
