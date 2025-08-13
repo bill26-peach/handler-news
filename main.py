@@ -1,31 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-ES7 并发加速版（保持你的 json_to_excel 写入逻辑不变）
+ES7 并发加速版（保留你现有的 json_to_excel 写入逻辑）
 - helpers.scan 流式拉取
-- AI 调用并发、连接复用、重试
-- 最终仍调用 json_to_excel(json_str_list, f"{month}_news.xlsx")
+- AI 调用并发、连接复用、重试、关键日志
+- 最终仍调用 json_to_excel(json_list, f"{month}_news.xlsx")
 """
 import json
 import re
 import calendar
+import time
+import logging
 from datetime import date, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Iterable, List
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from elasticsearch import Elasticsearch, helpers, exceptions
+from json_excel import json_to_excel
+# ======================= 日志设置 =======================
+logging.basicConfig(
+    level=logging.INFO,  # 可改为 DEBUG 以查看更详细日志
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
 
 
-# -----------------------------------------------------------------------
-
-# ============== 配置 ==============
+# ======================= 配置区 =======================
 ES_HOSTS = ["http://10.10.25.22:9200"]
 INDEX = "biz_tos_rss_news"
-username = "elastic"
-password = "easymer@es@2023"
+USERNAME = "elastic"
+PASSWORD = "easymer@es@2023"
 
-news_channels = [
+NEWS_CHANNELS = [
     "今日新闻网-焦点", "今日新闻网-要闻", "ETtoday新闻云-即时新闻-热门", "ETTODAY新闻云-焦点新闻",
     "自由时报-首页-热门新闻", "联合新闻网-要闻", "中时新闻网-台湾", "东森新闻-热门",
     "三立新闻网-热门新闻板块", "TVBS新闻网-热门"
@@ -35,11 +43,13 @@ API_KEY = "app-bLCySrNdNLlYdLmYft16DgTY"
 URL = "http://10.10.25.34:8660/v1/workflows/run"
 
 # 并发/重试参数（按你服务的QPS与稳定性微调）
-MAX_WORKERS = 16
-REQUEST_TIMEOUT = 20
-MAX_RETRIES = 3
-BACKOFF_FACTOR = 0.6
+MAX_WORKERS = 16  # AI 并发线程数
+REQUEST_TIMEOUT = 20  # 单次 AI 调用超时（秒）
+MAX_RETRIES = 3  # 失败重试次数
+BACKOFF_FACTOR = 0.6  # 重试退避系数
+PROGRESS_EVERY = 50  # AI 完成多少条打印一次进度
 
+# ======================= 工具与数据处理 =======================
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11,
            "十二": 12}
 
@@ -58,6 +68,7 @@ SITE_MAP = {
 
 
 def _parse_month(month_str: str):
+    """解析 '8月'/'08'/'8'/'一月' 等，返回 (YYYY-MM-DD, YYYY-MM-DD)"""
     m = None
     m_digits = re.search(r'(\d{1,2})', month_str)
     if m_digits:
@@ -78,12 +89,12 @@ def _parse_month(month_str: str):
     return first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
 
 
-def get_client_basic():
+def get_es_client() -> Elasticsearch:
     """只创建一次，外层复用"""
-    return Elasticsearch(ES_HOSTS, http_auth=(username, password), verify_certs=False)
+    return Elasticsearch(ES_HOSTS, http_auth=(USERNAME, PASSWORD), verify_certs=False)
 
 
-def export_all(es: Elasticsearch, index: str, query: dict):
+def export_all(es: Elasticsearch, index: str, query: dict) -> Iterable[Dict]:
     """生成器：逐条产出 _source（dict）"""
     for doc in helpers.scan(
             es,
@@ -98,7 +109,7 @@ def export_all(es: Elasticsearch, index: str, query: dict):
         yield doc["_source"]
 
 
-def normalize_item(item: dict) -> dict:
+def normalize_item(item: Dict) -> Dict:
     """站点映射 + 时间格式归一"""
     site_name = item.get("site_name")
     mapping = SITE_MAP.get(site_name)
@@ -119,8 +130,10 @@ def normalize_item(item: dict) -> dict:
     return item
 
 
-# ----------- 并发 AI 客户端 -----------
+# ======================= 并发 AI 客户端 =======================
 class AIClient:
+    """复用连接 + 重试 + 并发"""
+
     def __init__(self, url: str, api_key: str):
         self.url = url
         self.session = requests.Session()
@@ -135,82 +148,114 @@ class AIClient:
         self.session.mount("https://", adapter)
         self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    def call_api_one(self, new_obj: dict) -> str:
+    def call_api_one(self, new_obj: Dict) -> str:
         """
         输入 dict，输出 JSON 字符串（与你的 json_to_excel 兼容）
         - 优先返回 AI 结果（如果 API 返回 "result" 字段）
         - 失败则回退写原始对象
         """
-        payload = {"inputs": {"json": json.dumps(new_obj, ensure_ascii=False)},
-                   "response_mode": "blocking",
-                   "user": "admin"}
+        payload = {
+            "inputs": {"json": json.dumps(new_obj, ensure_ascii=False)},
+            "response_mode": "blocking",
+            "user": "admin"
+        }
         try:
             resp = self.session.post(self.url, headers=self.headers, json=payload, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             outputs_get = (data.get("data", {}) or {}).get("outputs", {}).get("result", "")
             if outputs_get:
-                # 如果 AI 返回的是 JSON 字符串，直接返回；否则把它包进 result 字段
+                # 若 AI 返回是 JSON 字符串，直接用；否则包进 ai_result 字段
                 try:
                     json.loads(outputs_get)
                     return outputs_get
                 except Exception:
                     return json.dumps({**new_obj, "ai_result": outputs_get}, ensure_ascii=False)
-            # 无结果时回写原始对象
+            # 无结果，回写原文
             return json.dumps(new_obj, ensure_ascii=False)
         except requests.RequestException as e:
-            print(f"请求失败: {e}")
+            logging.warning(f"[AI] 请求失败，将回退原文。错误：{e}")
             return json.dumps(new_obj, ensure_ascii=False)
 
 
-# ----------- 主流程 -----------
-def search_datas(month: str) -> list[str]:
+# ======================= 主流程 =======================
+def search_datas(month: str) -> List[str]:
+    logging.info(f"开始处理月份：{month}")
     month_gte, month_lte = _parse_month(month)
-    results: list[str] = []
-    es = get_client_basic()
+    results: List[str] = []
+    es = get_es_client()
     ai = AIClient(URL, API_KEY)
 
-    # 1) 先把 ES 结果“规范化”为 dict 列表（这里分频道遍历，但复用同一个 ES 连接）
-    def iter_docs():
-        for channel in news_channels:
-            query = {
-                "query": {"bool": {
-                    "must": [
-                        {"match": {"nopl": channel}},
-                        {"range": {"catm": {"gte": f"{month_gte} 00:00:00",
-                                            "lte": f"{month_lte} 23:59:59"}}}
-                    ]
-                }}
-            }
-            try:
-                for src in export_all(es, INDEX, query):
-                    yield normalize_item(src)
-            except exceptions.AuthenticationException as e:
-                print("认证失败：", e)
-            except exceptions.AuthorizationException as e:
-                print("权限不足：", e)
-            except exceptions.ConnectionError as e:
-                print("连接失败：", e)
-            except Exception as e:
-                print("其他错误：", e)
+    total_docs = 0
+    docs: List[Dict] = []
 
-    # 2) 并发调用 AI，加速处理
+    # 1) 拉取并规范化 ES 数据（带频道级日志）
+    for channel in NEWS_CHANNELS:
+        logging.info(f"[ES] 开始查询频道：{channel}")
+        t0 = time.time()
+        query = {
+            "query": {"bool": {
+                "must": [
+                    {"match": {"nopl": channel}},
+                    {"range": {"catm": {"gte": f"{month_gte} 00:00:00",
+                                        "lte": f"{month_lte} 23:59:59"}}}
+                ]
+            }}
+        }
+        count = 0
+        try:
+            for src in export_all(es, INDEX, query):
+                docs.append(normalize_item(src))
+                count += 1
+            elapsed = time.time() - t0
+            logging.info(f"[ES] 完成频道：{channel}，共 {count} 条，用时 {elapsed:.2f}s")
+            total_docs += count
+        except exceptions.AuthenticationException as e:
+            logging.error(f"[ES] 频道 {channel} 认证失败：{e}")
+        except exceptions.AuthorizationException as e:
+            logging.error(f"[ES] 频道 {channel} 权限不足：{e}")
+        except exceptions.ConnectionError as e:
+            logging.error(f"[ES] 频道 {channel} 连接失败：{e}")
+        except Exception as e:
+            logging.error(f"[ES] 频道 {channel} 其他错误：{e}")
+
+    logging.info(f"[ES] 所有频道数据获取完成，总计 {total_docs} 条记录")
+
+    # 2) 并发调用 AI（带进度日志）
+    logging.info(f"[AI] 开始并发调用，任务数：{len(docs)}，并发度：{MAX_WORKERS}")
+    t_ai = time.time()
+    done = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_list = [pool.submit(ai.call_api_one, obj) for obj in iter_docs()]
-        for fut in as_completed(future_list):
+        futures = [pool.submit(ai.call_api_one, obj) for obj in docs]
+        total = len(futures)
+        for fut in as_completed(futures):
             results.append(fut.result())
+            done += 1
+            if done % PROGRESS_EVERY == 0 or done == total:
+                logging.info(f"[AI] 已完成 {done}/{total} 条（{done / total * 100:.1f}%）")
 
-    print(f"查询与分析完成，共 {len(results)} 条")
+    logging.info(f"[AI] 全部调用完成，用时 {time.time() - t_ai:.2f}s")
+    logging.info(f"查询与分析完成，总计 {len(results)} 条")
+
     return results
 
 
-if __name__ == "__main__":
+def main():
     import argparse
-
-    parser = argparse.ArgumentParser(description="新闻解析（保持自定义Excel写入逻辑）")
-    parser.add_argument("--month", required=True, help="月份")
+    parser = argparse.ArgumentParser(description="新闻解析（并发+关键日志版）")
+    parser.add_argument("--month", required=True, help="月份（如 8 或 8月 或 八月）")
     args = parser.parse_args()
 
+    # 获取与分析
     json_results = search_datas(args.month)
-    # —— 保持你的写入逻辑不变：
-    json_to_excel(json_results, f"{args.month}_news.xlsx")
+
+    # 写 Excel
+    outfile = f"{args.month}_news.xlsx"
+    logging.info(f"[Excel] 开始写入：{outfile}")
+    t0 = time.time()
+    json_to_excel(json_results, outfile)
+    logging.info(f"[Excel] 写入完成，用时 {time.time() - t0:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
