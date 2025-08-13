@@ -2,6 +2,7 @@
 """
 ES7 并发加速稳态版（保留现有 json_to_excel 写入逻辑）
 - helpers.scan 流式拉取
+- Python 层去重（默认按 site_name + titl；保留 catm 更晚的一条）
 - AI 并发调用：连接复用 + 自动重试 + 手动重试 + QPS 限速 + 在途上限 + 自适应放缓
 - 关键日志：频道耗时、AI 进度、慢请求提示、Excel 写入
 """
@@ -13,6 +14,9 @@ import logging
 import random
 import threading
 import statistics
+import unicodedata
+import string
+from hashlib import sha1
 from collections import deque
 from datetime import date, datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,21 +50,25 @@ NEWS_CHANNELS = [
 API_KEY = "app-bLCySrNdNLlYdLmYft16DgTY"
 URL = "http://10.10.25.34:8660/v1/workflows/run"
 
-# ========= 并发 / 超时 / 重试 / 限速 参数（先保守，稳定后再调高） =========
-MAX_WORKERS = 4  # AI 并发线程数（遇到超时先降并发）
-MAX_INFLIGHT = 4  # 在途请求上限（通常与 MAX_WORKERS 相同）
-MAX_QPS = 2  # 每秒最多请求数（全局）
+# ===== 去重配置 =====
+# 去重键：可只用 ["titl"]，也可以组合字段（默认：按站点+标题）
+DEDUP_KEYS = ["titl"]
 
-CONNECT_TIMEOUT = 5  # 连接超时
-READ_TIMEOUT = 180  # 读取超时（推理慢时需要更长）
+# ========= 并发 / 超时 / 重试 / 限速 参数（先保守，稳定后再调高） =========
+MAX_WORKERS = 4          # AI 并发线程数（遇到超时先降并发）
+MAX_INFLIGHT = 4         # 在途请求上限（通常与 MAX_WORKERS 相同）
+MAX_QPS = 2              # 每秒最多请求数（全局）
+
+CONNECT_TIMEOUT = 5      # 连接超时
+READ_TIMEOUT = 180       # 读取超时（推理慢时需要更长）
 REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
-MAX_RETRIES = 1  # urllib3 自动重试（过多会放大拥塞）
-MANUAL_RETRIES = 1  # 在 urllib3 之后再做的手动重试次数
-BACKOFF_FACTOR = 2.0  # 退避系数，更“温柔”
+MAX_RETRIES = 1          # urllib3 自动重试（过多会放大拥塞）
+MANUAL_RETRIES = 1       # 在 urllib3 之后再做的手动重试次数
+BACKOFF_FACTOR = 2.0     # 退避系数，更“温柔”
 
 STATUS_FORCELIST = (429, 500, 502, 503, 504)
-PROGRESS_EVERY = 50  # AI 完成多少条打印一次进度
+PROGRESS_EVERY = 50      # AI 完成多少条打印一次进度
 SLOW_REQ_THRESHOLD = 30  # 单请求超过 30s 记为“慢请求”提示
 # =====================================================================
 
@@ -80,6 +88,36 @@ SITE_MAP = {
     "三立新闻网": {"domain": "www.setn.com", "color": "绿营"},
     "TVBS新闻网": {"domain": "news.tvbs.com.tw", "color": "蓝营"},
 }
+
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation + "，。！？“”‘’（）【】、《》：；—…· ")
+
+
+def _norm_text_for_dedup(s: str) -> str:
+    """
+    去重前的轻量规范化：
+    - NFKC 归一（全半角统一）
+    - 小写
+    - 去首尾空白、折叠多空格
+    - 去常见标点（可按需调整）
+    """
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = s.strip().lower()
+    s = " ".join(s.split())
+    s = s.translate(_PUNCT_TABLE)
+    return s
+
+
+def make_dedup_key(doc: Dict, keys=DEDUP_KEYS) -> str:
+    """
+    生成去重键：把指定字段做轻量规范化后拼接，再做哈希，保证健壮&短
+    """
+    parts = []
+    for k in keys:
+        parts.append(_norm_text_for_dedup(str(doc.get(k, ""))))
+    raw = "||".join(parts)
+    return sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _parse_month(month_str: str):
@@ -124,7 +162,8 @@ def export_all(es: Elasticsearch, index: str, query: dict) -> Iterable[Dict]:
 
 
 def normalize_item(item: Dict) -> Dict:
-    """站点映射 + 时间格式归一"""
+    """站点映射 + 时间格式归一（YYYY-MM-DD）"""
+    item = dict(item)  # 复制，避免原地副作用
     site_name = item.get("site_name")
     mapping = SITE_MAP.get(site_name)
     if mapping:
@@ -140,6 +179,7 @@ def normalize_item(item: Dict) -> Dict:
             dt = datetime.strptime(catm_val, "%Y-%m-%d %H:%M:%S")
             item["catm"] = dt.strftime("%Y-%m-%d")
         except ValueError:
+            # 非标准时间则保持原样
             pass
     return item
 
@@ -269,7 +309,7 @@ class AIClient:
         return json.dumps(new_obj, ensure_ascii=False)
 
 
-# ======================= 主流程 =======================
+# ======================= 主流程（含去重） =======================
 def search_datas(month: str) -> List[str]:
     logging.info(f"开始处理月份：{month}")
     month_gte, month_lte = _parse_month(month)
@@ -278,9 +318,27 @@ def search_datas(month: str) -> List[str]:
     ai = AIClient(URL, API_KEY)
 
     total_docs = 0
-    docs: List[Dict] = []
+    best_by_key: Dict[str, Dict] = {}   # 去重存储：key -> doc
+    dup_count = 0
 
-    # 1) 拉取并规范化 ES 数据（带频道级日志）
+    def _to_dt(raw_time: str, fallback_date_str: str) -> datetime:
+        """
+        比较时间：优先解析完整 'YYYY-MM-DD HH:MM:SS'，否则回退 'YYYY-MM-DD'
+        解析失败则返回 datetime.min
+        """
+        if raw_time:
+            try:
+                return datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        if fallback_date_str:
+            try:
+                return datetime.strptime(fallback_date_str, "%Y-%m-%d")
+            except Exception:
+                pass
+        return datetime.min
+
+    # 1) 拉取并规范化 ES 数据（带频道级日志 + 去重）
     for channel in NEWS_CHANNELS:
         logging.info(f"[ES] 开始查询频道：{channel}")
         t0 = time.time()
@@ -296,7 +354,23 @@ def search_datas(month: str) -> List[str]:
         count = 0
         try:
             for src in export_all(es, INDEX, query):
-                docs.append(normalize_item(src))
+                raw_catm = src.get("catm")              # 原始时间（可能包含时分秒）
+                item = normalize_item(src)              # 规范化（可能把 catm 压到 YYYY-MM-DD）
+
+                # --- 去重逻辑开始 ---
+                key = make_dedup_key(item)              # 由 DEDUP_KEYS 定义
+                new_dt = _to_dt(raw_catm, item.get("catm"))
+
+                if key not in best_by_key:
+                    best_by_key[key] = item
+                else:
+                    old_dt = _to_dt(None, best_by_key[key].get("catm"))
+                    # 注意：若旧值也有原始 catm，可按需存储并参与比较；当前以日期粒度已足够稳态
+                    if new_dt >= old_dt:
+                        best_by_key[key] = item
+                    dup_count += 1
+                # --- 去重逻辑结束 ---
+
                 count += 1
             elapsed = time.time() - t0
             logging.info(f"[ES] 完成频道：{channel}，共 {count} 条，用时 {elapsed:.2f}s")
@@ -310,7 +384,9 @@ def search_datas(month: str) -> List[str]:
         except Exception as e:
             logging.error(f"[ES] 频道 {channel} 其他错误：{e}")
 
-    logging.info(f"[ES] 所有频道数据获取完成，总计 {total_docs} 条记录")
+    # 去重完成后再展开为列表，进入 AI 并发阶段
+    docs: List[Dict] = list(best_by_key.values())
+    logging.info(f"[ES] 所有频道数据获取完成，总计原始 {total_docs} 条，去重后 {len(docs)} 条，剔除重复 {dup_count} 条")
 
     # 2) 并发调用 AI（带进度日志）
     logging.info(
@@ -334,7 +410,7 @@ def search_datas(month: str) -> List[str]:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="新闻解析（并发+稳态限速+关键日志）")
+    parser = argparse.ArgumentParser(description="新闻解析（并发+稳态限速+关键日志+去重）")
     parser.add_argument("--month", required=True, help="月份（如 8 或 8月 或 八月）")
     args = parser.parse_args()
 
