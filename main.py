@@ -415,7 +415,7 @@ def main():
     args = parser.parse_args()
 
     json_results = search_datas(args.month)
-
+    print(len(json_results))
     outfile = f"{args.month}_news.xlsx"
     logging.info(f"[Excel] 开始写入：{outfile}")
     t0 = time.time()
