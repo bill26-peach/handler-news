@@ -407,6 +407,21 @@ def search_datas(month: str) -> List[str]:
 
     return results
 
+def sort_json_by_catm(json_list):
+    def to_dt(v):
+        if not v:
+            return datetime.min
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(v, fmt)
+            except Exception:
+                pass
+        return datetime.min
+
+    return sorted(
+        json_list,
+        key=lambda s: to_dt(json.loads(s).get("catm"))
+    )
 
 def main():
     import argparse
@@ -415,7 +430,9 @@ def main():
     args = parser.parse_args()
 
     json_results = search_datas(args.month)
-    print(len(json_results))
+
+    # ✅ 按 catm 时间排序
+    json_results = sort_json_by_catm(json_results)
     outfile = f"{args.month}_news.xlsx"
     logging.info(f"[Excel] 开始写入：{outfile}")
     t0 = time.time()

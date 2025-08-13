@@ -4,7 +4,6 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 
 def json_to_excel(json_str, output_file):
-    print(len(json_str))
     parsed_data = [json.loads(item) for item in json_str]
     header_mapping = {
         "catm": "报告时间", "site_name": "媒体", "cntt": "内容",
