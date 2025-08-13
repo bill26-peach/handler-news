@@ -47,25 +47,26 @@ API_KEY = "app-bLCySrNdNLlYdLmYft16DgTY"
 URL = "http://10.10.25.34:8660/v1/workflows/run"
 
 # ========= 并发 / 超时 / 重试 / 限速 参数（先保守，稳定后再调高） =========
-MAX_WORKERS     = 4      # AI 并发线程数（遇到超时先降并发）
-MAX_INFLIGHT    = 4      # 在途请求上限（通常与 MAX_WORKERS 相同）
-MAX_QPS         = 2      # 每秒最多请求数（全局）
+MAX_WORKERS = 4  # AI 并发线程数（遇到超时先降并发）
+MAX_INFLIGHT = 4  # 在途请求上限（通常与 MAX_WORKERS 相同）
+MAX_QPS = 2  # 每秒最多请求数（全局）
 
-CONNECT_TIMEOUT = 5      # 连接超时
-READ_TIMEOUT    = 180    # 读取超时（推理慢时需要更长）
+CONNECT_TIMEOUT = 5  # 连接超时
+READ_TIMEOUT = 180  # 读取超时（推理慢时需要更长）
 REQUEST_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
-MAX_RETRIES     = 1      # urllib3 自动重试（过多会放大拥塞）
-MANUAL_RETRIES  = 1      # 在 urllib3 之后再做的手动重试次数
-BACKOFF_FACTOR  = 2.0    # 退避系数，更“温柔”
+MAX_RETRIES = 1  # urllib3 自动重试（过多会放大拥塞）
+MANUAL_RETRIES = 1  # 在 urllib3 之后再做的手动重试次数
+BACKOFF_FACTOR = 2.0  # 退避系数，更“温柔”
 
 STATUS_FORCELIST = (429, 500, 502, 503, 504)
-PROGRESS_EVERY   = 50    # AI 完成多少条打印一次进度
+PROGRESS_EVERY = 50  # AI 完成多少条打印一次进度
 SLOW_REQ_THRESHOLD = 30  # 单请求超过 30s 记为“慢请求”提示
 # =====================================================================
 
 # ======================= 工具与数据处理 =======================
-_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11,
+           "十二": 12}
 
 SITE_MAP = {
     "今日新闻网": {"domain": "www.nownews.com", "color": "蓝营"},
@@ -79,6 +80,7 @@ SITE_MAP = {
     "三立新闻网": {"domain": "www.setn.com", "color": "绿营"},
     "TVBS新闻网": {"domain": "news.tvbs.com.tw", "color": "蓝营"},
 }
+
 
 def _parse_month(month_str: str):
     """解析 '8月'/'08'/'8'/'一月' 等，返回 (YYYY-MM-DD, YYYY-MM-DD)"""
@@ -101,22 +103,25 @@ def _parse_month(month_str: str):
     last_day = date(year, m, min(30 if cap_to_30 else last_dom, last_dom))
     return first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
 
+
 def get_es_client() -> Elasticsearch:
     return Elasticsearch(ES_HOSTS, http_auth=(USERNAME, PASSWORD), verify_certs=False)
+
 
 def export_all(es: Elasticsearch, index: str, query: dict) -> Iterable[Dict]:
     """生成器：逐条产出 _source（dict）"""
     for doc in helpers.scan(
-        es,
-        index=index,
-        query=query,
-        scroll="2m",
-        size=1000,
-        request_timeout=120,
-        preserve_order=False,
-        _source_includes=["catm", "site_name", "nopl", "cntt", "titl"]
+            es,
+            index=index,
+            query=query,
+            scroll="2m",
+            size=1000,
+            request_timeout=120,
+            preserve_order=False,
+            _source_includes=["catm", "site_name", "nopl", "cntt", "titl", "site_domain_type_chn"]
     ):
         yield doc["_source"]
+
 
 def normalize_item(item: Dict) -> Dict:
     """站点映射 + 时间格式归一"""
@@ -138,9 +143,11 @@ def normalize_item(item: Dict) -> Dict:
             pass
     return item
 
+
 # ======================= 限速 / 在途控制 / 延迟观测 =======================
 class RateLimiter:
     """滑动窗口限速：最多 qps 次/秒"""
+
     def __init__(self, qps: int):
         self.qps = qps
         self.lock = threading.Lock()
@@ -159,9 +166,11 @@ class RateLimiter:
                     time.sleep(sleep_for)
             self.window.append(time.time())
 
+
 rate_limiter = RateLimiter(MAX_QPS)
 inflight_sema = threading.BoundedSemaphore(MAX_INFLIGHT)
 lat_samples = deque(maxlen=50)  # 记录最近请求耗时
+
 
 def _pack_result(outputs_get: str, new_obj: Dict) -> str:
     if outputs_get:
@@ -172,9 +181,11 @@ def _pack_result(outputs_get: str, new_obj: Dict) -> str:
             return json.dumps({**new_obj, "ai_result": outputs_get}, ensure_ascii=False)
     return json.dumps(new_obj, ensure_ascii=False)
 
+
 # ======================= 并发 AI 客户端 =======================
 class AIClient:
     """复用连接 + 自动重试 + 手动重试 + 限流 + 在途上限 + 自适应放缓"""
+
     def __init__(self, url: str, api_key: str):
         self.url = url
         self.session = requests.Session()
@@ -203,7 +214,7 @@ class AIClient:
         }
 
         for attempt in range(1, MANUAL_RETRIES + 1):
-            rate_limiter.acquire()   # QPS 控制
+            rate_limiter.acquire()  # QPS 控制
             inflight_sema.acquire()  # 在途上限
             start = time.time()
             try:
@@ -257,6 +268,7 @@ class AIClient:
         logging.error("[AI] 多次重试仍失败，回退原文")
         return json.dumps(new_obj, ensure_ascii=False)
 
+
 # ======================= 主流程 =======================
 def search_datas(month: str) -> List[str]:
     logging.info(f"开始处理月份：{month}")
@@ -301,7 +313,8 @@ def search_datas(month: str) -> List[str]:
     logging.info(f"[ES] 所有频道数据获取完成，总计 {total_docs} 条记录")
 
     # 2) 并发调用 AI（带进度日志）
-    logging.info(f"[AI] 开始并发调用，任务数：{len(docs)}，并发度：{MAX_WORKERS}，在途上限：{MAX_INFLIGHT}，限速：{MAX_QPS} qps")
+    logging.info(
+        f"[AI] 开始并发调用，任务数：{len(docs)}，并发度：{MAX_WORKERS}，在途上限：{MAX_INFLIGHT}，限速：{MAX_QPS} qps")
     t_ai = time.time()
     done = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -318,6 +331,7 @@ def search_datas(month: str) -> List[str]:
 
     return results
 
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="新闻解析（并发+稳态限速+关键日志）")
@@ -331,6 +345,7 @@ def main():
     t0 = time.time()
     json_to_excel(json_results, outfile)
     logging.info(f"[Excel] 写入完成，用时 {time.time() - t0:.2f}s")
+
 
 if __name__ == "__main__":
     main()

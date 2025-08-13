@@ -7,7 +7,7 @@ def json_to_excel(json_str, output_file):
     parsed_data = [json.loads(item) for item in json_str]
     header_mapping = {
         "catm": "报告时间", "site_name": "媒体", "cntt": "内容",
-        "titl": "新闻标题", "sentiment": "正负中立", "color": "蓝绿", "keyword": "关键字",
+        "titl": "新闻标题", "sentiment": "正负中立", "color": "蓝绿", "keyword": "关键字","site_domain_type_chn": "地区",
         "type": "类型(热点追踪、台媒焦点、重点关注、经贸资讯、港澳动态、其他)"
     }
     all_columns = ["来源", "期数", "报告时间", "类型(热点追踪、台媒焦点、重点关注、经贸资讯、港澳动态、其他)",
