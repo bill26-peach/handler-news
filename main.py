@@ -26,7 +26,7 @@ from json_excel import json_to_excel  # 你自己的写入实现
 
 # ======================= 日志设置 =======================
 logging.basicConfig(
-    level=logging.DEBUG,  # 需要更详细可改 DEBUG
+    level=logging.INFO,  # 需要更详细可改 DEBUG
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
