@@ -273,7 +273,8 @@ class AIClient:
                 resp.raise_for_status()
                 data = resp.json()
                 outputs_get = (data.get("data", {}) or {}).get("outputs", {}).get("result", "")
-                return _pack_result(outputs_get, new_obj)
+                return outputs_get
+                # return _pack_result(outputs_get, new_obj)
 
             except requests.ReadTimeout as e:
                 wait = (BACKOFF_FACTOR * (2 ** (attempt - 1))) + random.uniform(0.5, 1.0)
@@ -397,7 +398,13 @@ def search_datas(month: str) -> List[str]:
         futures = [pool.submit(ai.call_api_one, obj) for obj in docs]
         total = len(futures)
         for fut in as_completed(futures):
-            results.append(fut.result())
+            res_str = fut.result()
+            # 若返回空，不进行文本写入
+            try:
+                json.loads(res_str)
+                results.append(res_str)
+            except Exception:
+                logging.info("[AI] 丢弃 result 为空的记录")
             done += 1
             if done % PROGRESS_EVERY == 0 or done == total:
                 logging.info(f"[AI] 已完成 {done}/{total} 条（{done / total * 100:.1f}%）")
